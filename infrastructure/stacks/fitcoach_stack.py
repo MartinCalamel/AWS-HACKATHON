@@ -1,16 +1,16 @@
 """
 Stack CDK principal pour FitCoach AI.
-Suit exactement l'architecture.drawio :
+Suit l'architecture.drawio :
 
 - Amazon Cognito (User Pool fitcoach-users)
 - API Gateway REST (CORS enabled)
-  - POST /analyze-pose → fitcoach-pose-analysis (512MB, 30s, MediaPipe)
-  - POST /generate-planning → fitcoach-planning (256MB, 30s, Bedrock)
-  - POST /get-advice → fitcoach-advice (256MB, 30s, Bedrock)
+  - POST /analyze-pose → fitcoach-pose-analysis (512MB, 30s)
+  - POST /generate-planning → fitcoach-planning (256MB, 30s)
+  - POST /get-advice → fitcoach-advice (256MB, 30s)
 - DynamoDB
   - fitcoach-plannings (PK: userId, SK: createdAt)
   - fitcoach-sessions (PK: userId, SK: sessionId)
-- Amazon Bedrock (Claude 3 Haiku)
+- Amazon Bedrock (Claude 3 Haiku) pour pose + planning + advice
 - IAM Roles (bedrock:InvokeModel, dynamodb:Read/Write)
 """
 from aws_cdk import (
@@ -87,19 +87,26 @@ class FitCoachStack(Stack):
         )
 
         # ===== Lambda - fitcoach-pose-analysis =====
-        # 512 MB | 30s timeout | MediaPipe Pose
-        # Uses Docker container to include MediaPipe native dependencies
-        pose_lambda = _lambda.DockerImageFunction(
+        # 512 MB | 30s timeout | Bedrock Claude Vision
+        pose_lambda = _lambda.Function(
             self, "PoseAnalysisLambda",
             function_name="fitcoach-pose-analysis",
-            code=_lambda.DockerImageCode.from_image_asset(
+            runtime=_lambda.Runtime.PYTHON_3_12,
+            handler="handler.handler",
+            code=_lambda.Code.from_asset(
                 os.path.join(os.path.dirname(__file__), "..", "..", "backend", "pose_analysis")
             ),
             timeout=Duration.seconds(30),
             memory_size=512,
         )
 
-        # fitcoach-pose-analysis writes to fitcoach-sessions
+        # Permissions: bedrock:InvokeModel + dynamodb sessions
+        pose_lambda.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=["bedrock:InvokeModel"],
+                resources=["*"],
+            )
+        )
         sessions_table.grant_read_write_data(pose_lambda)
 
         # ===== Lambda - fitcoach-planning =====
@@ -116,7 +123,7 @@ class FitCoachStack(Stack):
             memory_size=256,
         )
 
-        # fitcoach-planning: bedrock:InvokeModel + dynamodb Read/Write
+        # Permissions: bedrock:InvokeModel + dynamodb plannings
         planning_lambda.add_to_role_policy(
             iam.PolicyStatement(
                 actions=["bedrock:InvokeModel"],
@@ -139,7 +146,7 @@ class FitCoachStack(Stack):
             memory_size=256,
         )
 
-        # fitcoach-advice: bedrock:InvokeModel
+        # Permissions: bedrock:InvokeModel
         advice_lambda.add_to_role_policy(
             iam.PolicyStatement(
                 actions=["bedrock:InvokeModel"],
