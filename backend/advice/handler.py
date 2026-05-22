@@ -1,5 +1,8 @@
 """
 Lambda handler pour la génération de conseils personnalisés via Bedrock.
+Fournit des recommandations détaillées basées sur l'historique de posture.
+
+256 MB | 30s timeout
 """
 import json
 import boto3

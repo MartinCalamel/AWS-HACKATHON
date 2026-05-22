@@ -7,9 +7,6 @@ app = cdk.App()
 FitCoachStack(
     app,
     "FitCoachAIStack",
-    env=cdk.Environment(
-        account=None,  # Utilise le compte AWS configuré
-        region="us-east-1",
-    ),
+    env=cdk.Environment(region="us-east-1"),
 )
 app.synth()

@@ -1,83 +1,70 @@
 """
 Lambda handler pour l'analyse de posture via webcam.
-Utilise Amazon Rekognition pour détecter les landmarks du corps
+Utilise MediaPipe Pose pour détecter les landmarks du corps
 et évaluer la qualité de l'exercice.
+
+512 MB | 30s timeout
 """
 import json
 import base64
-import math
-import boto3
+import numpy as np
+from io import BytesIO
+from PIL import Image
+import mediapipe as mp
 
-rekognition = boto3.client("rekognition", region_name="us-east-1")
+mp_pose = mp.solutions.pose
 
-# Mapping des landmarks Rekognition utiles
-# Voir: https://docs.aws.amazon.com/rekognition/latest/dg/API_Pose.html
-LANDMARK_NAMES = {
-    "leftShoulder": "leftShoulder",
-    "rightShoulder": "rightShoulder",
-    "leftElbow": "leftElbow",
-    "rightElbow": "rightElbow",
-    "leftWrist": "leftWrist",
-    "rightWrist": "rightWrist",
-    "leftHip": "leftHip",
-    "rightHip": "rightHip",
-    "leftKnee": "leftKnee",
-    "rightKnee": "rightKnee",
-    "leftAnkle": "leftAnkle",
-    "rightAnkle": "rightAnkle",
-}
-
-# Configuration des exercices avec les landmarks nécessaires
+# Angles idéaux par exercice
 EXERCISE_CONFIG = {
     "pushups": {
         "name": "Pompes",
-        "angles": {
-            "elbow": {
-                "points": ["leftShoulder", "leftElbow", "leftWrist"],
-                "ideal_min": 70,
-                "ideal_max": 160,
-            },
-            "hip": {
-                "points": ["leftShoulder", "leftHip", "leftKnee"],
-                "ideal_min": 160,
-                "ideal_max": 180,
-            },
+        "key_angles": {
+            "elbow": {"min": 70, "max": 160, "landmarks": [11, 13, 15]},
+            "hip": {"min": 160, "max": 180, "landmarks": [11, 23, 25]},
+        },
+        "phases": {
+            "down": {"elbow": (70, 100)},
+            "up": {"elbow": (140, 180)},
         },
     },
     "squats": {
         "name": "Squats",
-        "angles": {
-            "knee": {
-                "points": ["leftHip", "leftKnee", "leftAnkle"],
-                "ideal_min": 70,
-                "ideal_max": 170,
-            },
-            "hip": {
-                "points": ["leftShoulder", "leftHip", "leftKnee"],
-                "ideal_min": 70,
-                "ideal_max": 170,
-            },
+        "key_angles": {
+            "knee": {"min": 70, "max": 170, "landmarks": [23, 25, 27]},
+            "hip": {"min": 70, "max": 170, "landmarks": [11, 23, 25]},
+        },
+        "phases": {
+            "down": {"knee": (70, 100)},
+            "up": {"knee": (150, 180)},
         },
     },
     "curls": {
         "name": "Curls",
-        "angles": {
-            "elbow": {
-                "points": ["leftShoulder", "leftElbow", "leftWrist"],
-                "ideal_min": 30,
-                "ideal_max": 160,
-            },
+        "key_angles": {
+            "elbow": {"min": 30, "max": 160, "landmarks": [11, 13, 15]},
+        },
+        "phases": {
+            "contracted": {"elbow": (30, 60)},
+            "extended": {"elbow": (140, 170)},
         },
     },
 }
 
 
-def calculate_angle(ax, ay, bx, by, cx, cy):
-    """Calcule l'angle au point B formé par les points A, B, C (en degrés)."""
-    radians = math.atan2(cy - by, cx - bx) - math.atan2(ay - by, ax - bx)
-    angle = abs(radians * 180.0 / math.pi)
+def calculate_angle(a, b, c):
+    """Calcule l'angle entre trois points (en degrés)."""
+    a = np.array(a)
+    b = np.array(b)
+    c = np.array(c)
+
+    radians = np.arctan2(c[1] - b[1], c[0] - b[0]) - np.arctan2(
+        a[1] - b[1], a[0] - b[0]
+    )
+    angle = np.abs(radians * 180.0 / np.pi)
+
     if angle > 180.0:
         angle = 360 - angle
+
     return angle
 
 
@@ -103,7 +90,7 @@ def get_feedback(exercise, angles):
         hip_angle = angles.get("hip", 90)
 
         if knee_angle < 70:
-            feedback.append("Vos genoux sont trop fléchis. Remontez légèrement.")
+            feedback.append("Attention, vos genoux sont trop fléchis. Remontez légèrement.")
         if hip_angle < 70:
             feedback.append("Gardez le dos plus droit, ne vous penchez pas trop en avant.")
         if knee_angle > 150:
@@ -124,22 +111,40 @@ def get_feedback(exercise, angles):
     return feedback
 
 
+def determine_phase(exercise, angles):
+    """Détermine la phase actuelle de l'exercice."""
+    config = EXERCISE_CONFIG.get(exercise, {})
+    phases = config.get("phases", {})
+
+    for phase_name, phase_angles in phases.items():
+        match = True
+        for angle_name, (min_val, max_val) in phase_angles.items():
+            if angle_name in angles:
+                if not (min_val <= angles[angle_name] <= max_val):
+                    match = False
+                    break
+        if match:
+            return phase_name
+
+    return "transition"
+
+
 def calculate_score(exercise, angles):
     """Calcule un score de posture de 0 à 100."""
     config = EXERCISE_CONFIG.get(exercise, {})
-    angle_configs = config.get("angles", {})
+    key_angles = config.get("key_angles", {})
 
-    if not angle_configs:
+    if not key_angles:
         return 50
 
     total_score = 0
     count = 0
 
-    for angle_name, angle_config in angle_configs.items():
+    for angle_name, angle_config in key_angles.items():
         if angle_name in angles:
             angle_val = angles[angle_name]
-            min_val = angle_config["ideal_min"]
-            max_val = angle_config["ideal_max"]
+            min_val = angle_config["min"]
+            max_val = angle_config["max"]
             mid = (min_val + max_val) / 2
             range_val = (max_val - min_val) / 2
 
@@ -149,29 +154,6 @@ def calculate_score(exercise, angles):
             count += 1
 
     return int(total_score / count) if count > 0 else 50
-
-
-def determine_phase(exercise, angles):
-    """Détermine la phase actuelle de l'exercice."""
-    if exercise == "pushups":
-        elbow = angles.get("elbow", 90)
-        if elbow < 100:
-            return "down"
-        elif elbow > 140:
-            return "up"
-    elif exercise == "squats":
-        knee = angles.get("knee", 90)
-        if knee < 100:
-            return "down"
-        elif knee > 150:
-            return "up"
-    elif exercise == "curls":
-        elbow = angles.get("elbow", 90)
-        if elbow < 60:
-            return "contracted"
-        elif elbow > 140:
-            return "extended"
-    return "transition"
 
 
 def handler(event, context):
@@ -186,86 +168,20 @@ def handler(event, context):
             image_b64 = image_b64.split(",")[1]
 
         # Décoder l'image
-        image_bytes = base64.b64decode(image_b64)
+        image_data = base64.b64decode(image_b64)
+        image = Image.open(BytesIO(image_data))
+        image_rgb = image.convert("RGB")
+        image_np = np.array(image_rgb)
 
-        # Appel à Rekognition pour détecter la pose
-        response = rekognition.detect_faces(
-            Image={"Bytes": image_bytes},
-            Attributes=["ALL"],
-        )
+        # Analyse avec MediaPipe Pose
+        with mp_pose.Pose(
+            static_image_mode=True,
+            model_complexity=1,
+            min_detection_confidence=0.5,
+        ) as pose:
+            results = pose.process(image_np)
 
-        # Rekognition detect_faces ne donne pas les landmarks du corps.
-        # On utilise detect_labels ou detect_custom_labels pour la pose.
-        # Meilleure approche : utiliser detect_protective_equipment ou
-        # directement les coordonnées via un modèle custom.
-        
-        # Alternative : utiliser Rekognition detect_faces pour la tête
-        # et estimer la posture via les proportions.
-        # 
-        # MEILLEURE SOLUTION : Utiliser Amazon Bedrock avec Claude Vision
-        # pour analyser la posture directement depuis l'image.
-
-        # Appel à Bedrock Claude Vision pour l'analyse de posture
-        bedrock = boto3.client("bedrock-runtime", region_name="us-east-1")
-
-        prompt = f"""Analyse cette image d'une personne faisant l'exercice "{exercise}" (pompes/squats/curls).
-
-Évalue la posture et réponds UNIQUEMENT en JSON valide avec ce format exact :
-{{
-  "angles": {{
-    "elbow": <angle_en_degrés_estimé>,
-    "hip": <angle_en_degrés_estimé>,
-    "knee": <angle_en_degrés_estimé>
-  }},
-  "feedback": ["conseil 1", "conseil 2"],
-  "score": <score_de_0_à_100>,
-  "phase": "<up|down|transition|contracted|extended>",
-  "detected": true
-}}
-
-Si tu ne peux pas détecter de personne, réponds :
-{{"detected": false, "feedback": ["Impossible de détecter votre posture."], "score": 0, "phase": "unknown", "angles": {{}}}}
-
-Sois précis sur les angles articulaires visibles. Pour les pompes, évalue le coude et la hanche. Pour les squats, le genou et la hanche. Pour les curls, le coude."""
-
-        bedrock_response = bedrock.invoke_model(
-            modelId="anthropic.claude-3-haiku-20240307-v1:0",
-            contentType="application/json",
-            accept="application/json",
-            body=json.dumps({
-                "anthropic_version": "bedrock-2023-05-31",
-                "max_tokens": 1024,
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "image",
-                                "source": {
-                                    "type": "base64",
-                                    "media_type": "image/jpeg",
-                                    "data": image_b64,
-                                },
-                            },
-                            {
-                                "type": "text",
-                                "text": prompt,
-                            },
-                        ],
-                    }
-                ],
-            }),
-        )
-
-        bedrock_body = json.loads(bedrock_response["body"].read())
-        text = bedrock_body["content"][0]["text"]
-
-        # Parser le JSON
-        json_start = text.find("{")
-        json_end = text.rfind("}") + 1
-        analysis = json.loads(text[json_start:json_end])
-
-        if not analysis.get("detected", True):
+        if not results.pose_landmarks:
             return {
                 "statusCode": 200,
                 "headers": {
@@ -276,11 +192,32 @@ Sois précis sur les angles articulaires visibles. Pour les pompes, évalue le c
                 },
                 "body": json.dumps({
                     "repCount": 0,
-                    "feedback": analysis.get("feedback", ["Posture non détectée."]),
+                    "feedback": [
+                        "Impossible de détecter votre posture.",
+                        "Assurez-vous d'être bien visible dans le cadre.",
+                    ],
                     "score": 0,
                     "phase": "unknown",
                 }),
             }
+
+        # Extraire les landmarks
+        landmarks = results.pose_landmarks.landmark
+        config = EXERCISE_CONFIG.get(exercise, {})
+
+        # Calculer les angles articulaires
+        angles = {}
+        for angle_name, angle_config in config.get("key_angles", {}).items():
+            lm = angle_config["landmarks"]
+            a = [landmarks[lm[0]].x, landmarks[lm[0]].y]
+            b = [landmarks[lm[1]].x, landmarks[lm[1]].y]
+            c = [landmarks[lm[2]].x, landmarks[lm[2]].y]
+            angles[angle_name] = calculate_angle(a, b, c)
+
+        # Générer le résultat
+        feedback = get_feedback(exercise, angles)
+        phase = determine_phase(exercise, angles)
+        score = calculate_score(exercise, angles)
 
         return {
             "statusCode": 200,
@@ -292,9 +229,9 @@ Sois précis sur les angles articulaires visibles. Pour les pompes, évalue le c
             },
             "body": json.dumps({
                 "repCount": 0,
-                "feedback": analysis.get("feedback", []),
-                "score": analysis.get("score", 50),
-                "phase": analysis.get("phase", "transition"),
+                "feedback": feedback,
+                "score": score,
+                "phase": phase,
             }),
         }
 

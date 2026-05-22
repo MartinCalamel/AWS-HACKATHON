@@ -1,6 +1,8 @@
 """
 Lambda handler pour la génération de planning d'exercices.
-Utilise Amazon Bedrock (Claude) pour créer des programmes personnalisés.
+Utilise Amazon Bedrock (Claude 3 Haiku) pour créer des programmes personnalisés.
+
+256 MB | 30s timeout
 """
 import json
 import boto3
@@ -99,6 +101,7 @@ def generate_fallback_planning(days):
 
 def handler(event, context):
     """Lambda handler principal."""
+    days_per_week = 3
     try:
         body = json.loads(event.get("body", "{}"))
         level = body.get("level", "beginner")
@@ -107,7 +110,7 @@ def handler(event, context):
 
         prompt = generate_planning_prompt(level, goal, days_per_week)
 
-        # Appel à Bedrock (Claude)
+        # Appel à Bedrock (Claude 3 Haiku)
         response = bedrock.invoke_model(
             modelId="anthropic.claude-3-haiku-20240307-v1:0",
             contentType="application/json",
@@ -145,9 +148,7 @@ def handler(event, context):
 
     except Exception as e:
         # Fallback : planning par défaut
-        fallback = generate_fallback_planning(
-            int(body.get("daysPerWeek", 3)) if "body" in dir() else 3
-        )
+        fallback = generate_fallback_planning(days_per_week)
         return {
             "statusCode": 200,
             "headers": {
