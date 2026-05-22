@@ -1,6 +1,6 @@
 """
 Stack CDK principal pour FitCoach AI.
-Déploie : API Gateway, Lambda functions, DynamoDB, Cognito.
+Déploie : API Gateway, Lambda functions, DynamoDB, S3 + CloudFront (frontend).
 """
 from aws_cdk import (
     Stack,
@@ -11,7 +11,10 @@ from aws_cdk import (
     aws_apigateway as apigw,
     aws_dynamodb as dynamodb,
     aws_iam as iam,
-    aws_cognito as cognito,
+    aws_s3 as s3,
+    aws_s3_deployment as s3deploy,
+    aws_cloudfront as cloudfront,
+    aws_cloudfront_origins as origins,
 )
 from constructs import Construct
 
@@ -21,7 +24,6 @@ class FitCoachStack(Stack):
         super().__init__(scope, construct_id, **kwargs)
 
         # ===== DynamoDB =====
-        # Table pour stocker les plannings utilisateurs
         planning_table = dynamodb.Table(
             self, "PlanningTable",
             table_name="fitcoach-plannings",
@@ -35,7 +37,6 @@ class FitCoachStack(Stack):
             removal_policy=RemovalPolicy.DESTROY,
         )
 
-        # Table pour l'historique des sessions
         sessions_table = dynamodb.Table(
             self, "SessionsTable",
             table_name="fitcoach-sessions",
@@ -49,80 +50,70 @@ class FitCoachStack(Stack):
             removal_policy=RemovalPolicy.DESTROY,
         )
 
-        # ===== Cognito =====
-        user_pool = cognito.UserPool(
-            self, "FitCoachUserPool",
-            user_pool_name="fitcoach-users",
-            self_sign_up_enabled=True,
-            sign_in_aliases=cognito.SignInAliases(email=True),
-            auto_verify=cognito.AutoVerifiedAttrs(email=True),
-            password_policy=cognito.PasswordPolicy(
-                min_length=8,
-                require_lowercase=True,
-                require_uppercase=True,
-                require_digits=True,
-            ),
-            removal_policy=RemovalPolicy.DESTROY,
-        )
-
-        user_pool_client = cognito.UserPoolClient(
-            self, "FitCoachClient",
-            user_pool=user_pool,
-            auth_flows=cognito.AuthFlow(
-                user_password=True,
-                user_srp=True,
-            ),
-        )
-
-        # ===== Lambda - Analyse de posture =====
+        # ===== Lambda - Analyse de posture (Bedrock Vision) =====
         pose_lambda = _lambda.Function(
             self, "PoseAnalysisLambda",
             function_name="fitcoach-pose-analysis",
             runtime=_lambda.Runtime.PYTHON_3_12,
             handler="handler.handler",
             code=_lambda.Code.from_asset("../backend/pose_analysis"),
-            timeout=Duration.seconds(30),
-            memory_size=512,
+            timeout=Duration.seconds(60),
+            memory_size=256,
         )
 
-        # ===== Lambda - Planning =====
+        # Permission Bedrock pour l'analyse de posture (Claude Vision)
+        pose_lambda.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=["bedrock:InvokeModel"],
+                resources=["*"],
+            )
+        )
+
+        # Permission Rekognition (fallback)
+        pose_lambda.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=["rekognition:DetectFaces", "rekognition:DetectLabels"],
+                resources=["*"],
+            )
+        )
+
+        sessions_table.grant_read_write_data(pose_lambda)
+
+        # ===== Lambda - Planning (Bedrock) =====
         planning_lambda = _lambda.Function(
             self, "PlanningLambda",
             function_name="fitcoach-planning",
             runtime=_lambda.Runtime.PYTHON_3_12,
             handler="handler.handler",
             code=_lambda.Code.from_asset("../backend/planning"),
-            timeout=Duration.seconds(30),
+            timeout=Duration.seconds(60),
             memory_size=256,
         )
 
-        # Permissions Bedrock pour le planning
         planning_lambda.add_to_role_policy(
             iam.PolicyStatement(
                 actions=["bedrock:InvokeModel"],
-                resources=["arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-3-haiku-20240307-v1:0"],
+                resources=["*"],
             )
         )
 
-        # Permissions DynamoDB
         planning_table.grant_read_write_data(planning_lambda)
-        sessions_table.grant_read_write_data(pose_lambda)
 
-        # ===== Lambda - Conseils =====
+        # ===== Lambda - Conseils (Bedrock) =====
         advice_lambda = _lambda.Function(
             self, "AdviceLambda",
             function_name="fitcoach-advice",
             runtime=_lambda.Runtime.PYTHON_3_12,
             handler="handler.handler",
             code=_lambda.Code.from_asset("../backend/advice"),
-            timeout=Duration.seconds(30),
+            timeout=Duration.seconds(60),
             memory_size=256,
         )
 
         advice_lambda.add_to_role_policy(
             iam.PolicyStatement(
                 actions=["bedrock:InvokeModel"],
-                resources=["arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-3-haiku-20240307-v1:0"],
+                resources=["*"],
             )
         )
 
@@ -133,7 +124,9 @@ class FitCoachStack(Stack):
             default_cors_preflight_options=apigw.CorsOptions(
                 allow_origins=apigw.Cors.ALL_ORIGINS,
                 allow_methods=apigw.Cors.ALL_METHODS,
+                allow_headers=["Content-Type", "Authorization"],
             ),
+            binary_media_types=["*/*"],
         )
 
         # Routes
@@ -146,7 +139,67 @@ class FitCoachStack(Stack):
         advice = api.root.add_resource("get-advice")
         advice.add_method("POST", apigw.LambdaIntegration(advice_lambda))
 
+        # ===== S3 Bucket pour le frontend =====
+        frontend_bucket = s3.Bucket(
+            self, "FrontendBucket",
+            bucket_name=f"fitcoach-ai-frontend-{self.account}",
+            website_index_document="index.html",
+            website_error_document="index.html",
+            public_read_access=False,
+            block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
+            removal_policy=RemovalPolicy.DESTROY,
+            auto_delete_objects=True,
+        )
+
+        # ===== CloudFront Distribution =====
+        oai = cloudfront.OriginAccessIdentity(
+            self, "OAI",
+            comment="FitCoach AI Frontend",
+        )
+        frontend_bucket.grant_read(oai)
+
+        distribution = cloudfront.Distribution(
+            self, "FrontendDistribution",
+            default_behavior=cloudfront.BehaviorOptions(
+                origin=origins.S3Origin(
+                    frontend_bucket,
+                    origin_access_identity=oai,
+                ),
+                viewer_protocol_policy=cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
+            ),
+            default_root_object="index.html",
+            error_responses=[
+                cloudfront.ErrorResponse(
+                    http_status=404,
+                    response_http_status=200,
+                    response_page_path="/index.html",
+                    ttl=Duration.seconds(0),
+                ),
+                cloudfront.ErrorResponse(
+                    http_status=403,
+                    response_http_status=200,
+                    response_page_path="/index.html",
+                    ttl=Duration.seconds(0),
+                ),
+            ],
+        )
+
+        # Déployer le frontend buildé dans S3
+        s3deploy.BucketDeployment(
+            self, "DeployFrontend",
+            sources=[s3deploy.Source.asset("../frontend/dist")],
+            destination_bucket=frontend_bucket,
+            distribution=distribution,
+            distribution_paths=["/*"],
+        )
+
         # ===== Outputs =====
-        CfnOutput(self, "ApiUrl", value=api.url, description="URL de l'API")
-        CfnOutput(self, "UserPoolId", value=user_pool.user_pool_id)
-        CfnOutput(self, "UserPoolClientId", value=user_pool_client.user_pool_client_id)
+        CfnOutput(self, "ApiUrl",
+                  value=api.url,
+                  description="URL de l'API Gateway")
+        CfnOutput(self, "FrontendUrl",
+                  value=f"https://{distribution.distribution_domain_name}",
+                  description="URL du frontend (CloudFront)")
+        CfnOutput(self, "FrontendBucketName",
+                  value=frontend_bucket.bucket_name,
+                  description="Nom du bucket S3 frontend")
