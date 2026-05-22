@@ -1,6 +1,8 @@
 """
 Lambda handler pour la génération de conseils personnalisés via Bedrock.
 Fournit des recommandations détaillées basées sur l'historique de posture.
+
+256 MB | 30s timeout
 """
 import json
 import boto3
@@ -22,14 +24,14 @@ def handler(event, context):
             "curls": "curls de biceps",
         }
 
-        prompt = f"""Tu es un coach sportif bienveillant et expert. 
+        prompt = f"""Tu es un coach sportif bienveillant et expert.
 L'utilisateur fait des {exercise_names.get(exercise, exercise)}.
 
 Ses scores récents de posture : {scores}
 Problèmes fréquents détectés : {', '.join(common_issues) if common_issues else 'Aucun problème majeur'}
 
 Donne 3-5 conseils concrets et encourageants pour améliorer sa technique.
-Réponds en JSON : {{"advice": ["conseil 1", "conseil 2", ...]}}
+Réponds UNIQUEMENT en JSON valide : {{"advice": ["conseil 1", "conseil 2", ...]}}
 """
 
         response = bedrock.invoke_model(
@@ -55,19 +57,22 @@ Réponds en JSON : {{"advice": ["conseil 1", "conseil 2", ...]}}
             "headers": {
                 "Content-Type": "application/json",
                 "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Headers": "Content-Type",
+                "Access-Control-Allow-Methods": "POST,OPTIONS",
             },
             "body": json.dumps(advice_json),
         }
 
     except Exception as e:
         return {
-            "statusCode": 500,
+            "statusCode": 200,
             "headers": {
                 "Content-Type": "application/json",
                 "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Headers": "Content-Type",
+                "Access-Control-Allow-Methods": "POST,OPTIONS",
             },
             "body": json.dumps({
-                "error": str(e),
                 "advice": [
                     "Gardez une posture droite et contrôlée.",
                     "Respirez régulièrement pendant l'exercice.",

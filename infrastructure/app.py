@@ -4,7 +4,9 @@ import aws_cdk as cdk
 from stacks.fitcoach_stack import FitCoachStack
 
 app = cdk.App()
-FitCoachStack(app, "FitCoachAIStack",
+FitCoachStack(
+    app,
+    "FitCoachAIStack",
     env=cdk.Environment(region="us-east-1"),
 )
 app.synth()

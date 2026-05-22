@@ -2,6 +2,8 @@
 Lambda handler pour l'analyse de posture via webcam.
 Utilise MediaPipe Pose pour détecter les landmarks du corps
 et évaluer la qualité de l'exercice.
+
+512 MB | 30s timeout
 """
 import json
 import base64
@@ -66,10 +68,9 @@ def calculate_angle(a, b, c):
     return angle
 
 
-def get_feedback(exercise: str, angles: dict) -> list[str]:
+def get_feedback(exercise, angles):
     """Génère des conseils basés sur les angles détectés."""
     feedback = []
-    config = EXERCISE_CONFIG.get(exercise, {})
 
     if exercise == "pushups":
         hip_angle = angles.get("hip", 180)
@@ -110,7 +111,7 @@ def get_feedback(exercise: str, angles: dict) -> list[str]:
     return feedback
 
 
-def determine_phase(exercise: str, angles: dict) -> str:
+def determine_phase(exercise, angles):
     """Détermine la phase actuelle de l'exercice."""
     config = EXERCISE_CONFIG.get(exercise, {})
     phases = config.get("phases", {})
@@ -128,7 +129,7 @@ def determine_phase(exercise: str, angles: dict) -> str:
     return "transition"
 
 
-def calculate_score(exercise: str, angles: dict) -> int:
+def calculate_score(exercise, angles):
     """Calcule un score de posture de 0 à 100."""
     config = EXERCISE_CONFIG.get(exercise, {})
     key_angles = config.get("key_angles", {})
@@ -147,7 +148,6 @@ def calculate_score(exercise: str, angles: dict) -> int:
             mid = (min_val + max_val) / 2
             range_val = (max_val - min_val) / 2
 
-            # Score basé sur la distance au centre de la plage idéale
             distance = abs(angle_val - mid)
             score = max(0, 100 - (distance / range_val) * 50)
             total_score += score
@@ -170,9 +170,10 @@ def handler(event, context):
         # Décoder l'image
         image_data = base64.b64decode(image_b64)
         image = Image.open(BytesIO(image_data))
-        image_np = np.array(image)
+        image_rgb = image.convert("RGB")
+        image_np = np.array(image_rgb)
 
-        # Analyse avec MediaPipe
+        # Analyse avec MediaPipe Pose
         with mp_pose.Pose(
             static_image_mode=True,
             model_complexity=1,
@@ -186,10 +187,15 @@ def handler(event, context):
                 "headers": {
                     "Content-Type": "application/json",
                     "Access-Control-Allow-Origin": "*",
+                    "Access-Control-Allow-Headers": "Content-Type",
+                    "Access-Control-Allow-Methods": "POST,OPTIONS",
                 },
                 "body": json.dumps({
                     "repCount": 0,
-                    "feedback": ["Impossible de détecter votre posture. Assurez-vous d'être bien visible dans le cadre."],
+                    "feedback": [
+                        "Impossible de détecter votre posture.",
+                        "Assurez-vous d'être bien visible dans le cadre.",
+                    ],
                     "score": 0,
                     "phase": "unknown",
                 }),
@@ -199,7 +205,7 @@ def handler(event, context):
         landmarks = results.pose_landmarks.landmark
         config = EXERCISE_CONFIG.get(exercise, {})
 
-        # Calculer les angles
+        # Calculer les angles articulaires
         angles = {}
         for angle_name, angle_config in config.get("key_angles", {}).items():
             lm = angle_config["landmarks"]
@@ -218,9 +224,11 @@ def handler(event, context):
             "headers": {
                 "Content-Type": "application/json",
                 "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Headers": "Content-Type",
+                "Access-Control-Allow-Methods": "POST,OPTIONS",
             },
             "body": json.dumps({
-                "repCount": 0,  # Le comptage de reps nécessite un état persistant
+                "repCount": 0,
                 "feedback": feedback,
                 "score": score,
                 "phase": phase,
@@ -233,10 +241,12 @@ def handler(event, context):
             "headers": {
                 "Content-Type": "application/json",
                 "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Headers": "Content-Type",
+                "Access-Control-Allow-Methods": "POST,OPTIONS",
             },
             "body": json.dumps({
                 "error": str(e),
-                "feedback": ["Erreur interne du serveur."],
+                "feedback": ["Erreur lors de l'analyse. Réessayez."],
                 "score": 0,
                 "phase": "error",
                 "repCount": 0,

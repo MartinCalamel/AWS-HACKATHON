@@ -1,6 +1,8 @@
 """
 Lambda handler pour la génération de planning d'exercices.
-Utilise Amazon Bedrock (Claude) pour créer des programmes personnalisés.
+Utilise Amazon Bedrock (Claude 3 Haiku) pour créer des programmes personnalisés.
+
+256 MB | 30s timeout
 """
 import json
 import boto3
@@ -8,7 +10,7 @@ import boto3
 bedrock = boto3.client("bedrock-runtime", region_name="us-east-1")
 
 
-def generate_planning_prompt(level: str, goal: str, days_per_week: int) -> str:
+def generate_planning_prompt(level, goal, days_per_week):
     """Construit le prompt pour Bedrock."""
     level_fr = {
         "beginner": "débutant",
@@ -32,7 +34,7 @@ Profil de l'utilisateur :
 
 Les exercices disponibles sont : Pompes, Squats, Curls (biceps), Planche, Fentes, Dips.
 
-Réponds UNIQUEMENT en JSON valide avec ce format exact :
+Réponds UNIQUEMENT en JSON valide avec ce format exact (pas de texte avant ou après) :
 {{
   "planning": [
     {{
@@ -48,67 +50,7 @@ Génère exactement {days_per_week} jours d'entraînement. Adapte les séries et
 """
 
 
-def handler(event, context):
-    """Lambda handler principal."""
-    try:
-        body = json.loads(event.get("body", "{}"))
-        level = body.get("level", "beginner")
-        goal = body.get("goal", "general")
-        days_per_week = body.get("daysPerWeek", 3)
-
-        prompt = generate_planning_prompt(level, goal, days_per_week)
-
-        # Appel à Bedrock (Claude)
-        response = bedrock.invoke_model(
-            modelId="anthropic.claude-3-haiku-20240307-v1:0",
-            contentType="application/json",
-            accept="application/json",
-            body=json.dumps({
-                "anthropic_version": "bedrock-2023-05-31",
-                "max_tokens": 2048,
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": prompt,
-                    }
-                ],
-            }),
-        )
-
-        response_body = json.loads(response["body"].read())
-        assistant_message = response_body["content"][0]["text"]
-
-        # Parser le JSON de la réponse
-        # Chercher le JSON dans la réponse
-        json_start = assistant_message.find("{")
-        json_end = assistant_message.rfind("}") + 1
-        planning_json = json.loads(assistant_message[json_start:json_end])
-
-        return {
-            "statusCode": 200,
-            "headers": {
-                "Content-Type": "application/json",
-                "Access-Control-Allow-Origin": "*",
-            },
-            "body": json.dumps(planning_json),
-        }
-
-    except Exception as e:
-        # Fallback : planning par défaut
-        fallback_planning = generate_fallback_planning(
-            body.get("daysPerWeek", 3)
-        )
-        return {
-            "statusCode": 200,
-            "headers": {
-                "Content-Type": "application/json",
-                "Access-Control-Allow-Origin": "*",
-            },
-            "body": json.dumps({"planning": fallback_planning, "note": "Planning par défaut (erreur IA)"}),
-        }
-
-
-def generate_fallback_planning(days: int) -> list:
+def generate_fallback_planning(days):
     """Planning par défaut si Bedrock n'est pas disponible."""
     base_plans = [
         {
@@ -155,3 +97,65 @@ def generate_fallback_planning(days: int) -> list:
         },
     ]
     return base_plans[:days]
+
+
+def handler(event, context):
+    """Lambda handler principal."""
+    days_per_week = 3
+    try:
+        body = json.loads(event.get("body", "{}"))
+        level = body.get("level", "beginner")
+        goal = body.get("goal", "general")
+        days_per_week = body.get("daysPerWeek", 3)
+
+        prompt = generate_planning_prompt(level, goal, days_per_week)
+
+        # Appel à Bedrock (Claude 3 Haiku)
+        response = bedrock.invoke_model(
+            modelId="anthropic.claude-3-haiku-20240307-v1:0",
+            contentType="application/json",
+            accept="application/json",
+            body=json.dumps({
+                "anthropic_version": "bedrock-2023-05-31",
+                "max_tokens": 2048,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": prompt,
+                    }
+                ],
+            }),
+        )
+
+        response_body = json.loads(response["body"].read())
+        assistant_message = response_body["content"][0]["text"]
+
+        # Parser le JSON de la réponse
+        json_start = assistant_message.find("{")
+        json_end = assistant_message.rfind("}") + 1
+        planning_json = json.loads(assistant_message[json_start:json_end])
+
+        return {
+            "statusCode": 200,
+            "headers": {
+                "Content-Type": "application/json",
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Headers": "Content-Type",
+                "Access-Control-Allow-Methods": "POST,OPTIONS",
+            },
+            "body": json.dumps(planning_json),
+        }
+
+    except Exception as e:
+        # Fallback : planning par défaut
+        fallback = generate_fallback_planning(days_per_week)
+        return {
+            "statusCode": 200,
+            "headers": {
+                "Content-Type": "application/json",
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Headers": "Content-Type",
+                "Access-Control-Allow-Methods": "POST,OPTIONS",
+            },
+            "body": json.dumps({"planning": fallback}),
+        }

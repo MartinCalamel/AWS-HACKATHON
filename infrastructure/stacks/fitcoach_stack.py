@@ -1,6 +1,17 @@
 """
 Stack CDK principal pour FitCoach AI.
-Déploie : API Gateway, Lambda functions, DynamoDB, Cognito.
+Suit exactement l'architecture.drawio :
+
+- Amazon Cognito (User Pool fitcoach-users)
+- API Gateway REST (CORS enabled)
+  - POST /analyze-pose → fitcoach-pose-analysis (512MB, 30s, MediaPipe)
+  - POST /generate-planning → fitcoach-planning (256MB, 30s, Bedrock)
+  - POST /get-advice → fitcoach-advice (256MB, 30s, Bedrock)
+- DynamoDB
+  - fitcoach-plannings (PK: userId, SK: createdAt)
+  - fitcoach-sessions (PK: userId, SK: sessionId)
+- Amazon Bedrock (Claude 3 Haiku)
+- IAM Roles (bedrock:InvokeModel, dynamodb:Read/Write)
 """
 from aws_cdk import (
     Stack,
@@ -14,42 +25,14 @@ from aws_cdk import (
     aws_cognito as cognito,
 )
 from constructs import Construct
+import os
 
 
 class FitCoachStack(Stack):
     def __init__(self, scope: Construct, construct_id: str, **kwargs) -> None:
         super().__init__(scope, construct_id, **kwargs)
 
-        # ===== DynamoDB =====
-        # Table pour stocker les plannings utilisateurs
-        planning_table = dynamodb.Table(
-            self, "PlanningTable",
-            table_name="fitcoach-plannings",
-            partition_key=dynamodb.Attribute(
-                name="userId", type=dynamodb.AttributeType.STRING
-            ),
-            sort_key=dynamodb.Attribute(
-                name="createdAt", type=dynamodb.AttributeType.STRING
-            ),
-            billing_mode=dynamodb.BillingMode.PAY_PER_REQUEST,
-            removal_policy=RemovalPolicy.DESTROY,
-        )
-
-        # Table pour l'historique des sessions
-        sessions_table = dynamodb.Table(
-            self, "SessionsTable",
-            table_name="fitcoach-sessions",
-            partition_key=dynamodb.Attribute(
-                name="userId", type=dynamodb.AttributeType.STRING
-            ),
-            sort_key=dynamodb.Attribute(
-                name="sessionId", type=dynamodb.AttributeType.STRING
-            ),
-            billing_mode=dynamodb.BillingMode.PAY_PER_REQUEST,
-            removal_policy=RemovalPolicy.DESTROY,
-        )
-
-        # ===== Cognito =====
+        # ===== Amazon Cognito - User Pool fitcoach-users =====
         user_pool = cognito.UserPool(
             self, "FitCoachUserPool",
             user_pool_name="fitcoach-users",
@@ -74,79 +57,135 @@ class FitCoachStack(Stack):
             ),
         )
 
-        # ===== Lambda - Analyse de posture =====
-        pose_lambda = _lambda.Function(
+        # ===== Amazon DynamoDB =====
+        # Table fitcoach-plannings (PK: userId, SK: createdAt) PAY_PER_REQUEST
+        planning_table = dynamodb.Table(
+            self, "PlanningTable",
+            table_name="fitcoach-plannings",
+            partition_key=dynamodb.Attribute(
+                name="userId", type=dynamodb.AttributeType.STRING
+            ),
+            sort_key=dynamodb.Attribute(
+                name="createdAt", type=dynamodb.AttributeType.STRING
+            ),
+            billing_mode=dynamodb.BillingMode.PAY_PER_REQUEST,
+            removal_policy=RemovalPolicy.DESTROY,
+        )
+
+        # Table fitcoach-sessions (PK: userId, SK: sessionId) PAY_PER_REQUEST
+        sessions_table = dynamodb.Table(
+            self, "SessionsTable",
+            table_name="fitcoach-sessions",
+            partition_key=dynamodb.Attribute(
+                name="userId", type=dynamodb.AttributeType.STRING
+            ),
+            sort_key=dynamodb.Attribute(
+                name="sessionId", type=dynamodb.AttributeType.STRING
+            ),
+            billing_mode=dynamodb.BillingMode.PAY_PER_REQUEST,
+            removal_policy=RemovalPolicy.DESTROY,
+        )
+
+        # ===== Lambda - fitcoach-pose-analysis =====
+        # 512 MB | 30s timeout | MediaPipe Pose
+        # Uses Docker container to include MediaPipe native dependencies
+        pose_lambda = _lambda.DockerImageFunction(
             self, "PoseAnalysisLambda",
             function_name="fitcoach-pose-analysis",
-            runtime=_lambda.Runtime.PYTHON_3_12,
-            handler="handler.handler",
-            code=_lambda.Code.from_asset("../backend/pose_analysis"),
+            code=_lambda.DockerImageCode.from_image_asset(
+                os.path.join(os.path.dirname(__file__), "..", "..", "backend", "pose_analysis")
+            ),
             timeout=Duration.seconds(30),
             memory_size=512,
         )
 
-        # ===== Lambda - Planning =====
+        # fitcoach-pose-analysis writes to fitcoach-sessions
+        sessions_table.grant_read_write_data(pose_lambda)
+
+        # ===== Lambda - fitcoach-planning =====
+        # 256 MB | 30s timeout | Bedrock Claude
         planning_lambda = _lambda.Function(
             self, "PlanningLambda",
             function_name="fitcoach-planning",
             runtime=_lambda.Runtime.PYTHON_3_12,
             handler="handler.handler",
-            code=_lambda.Code.from_asset("../backend/planning"),
+            code=_lambda.Code.from_asset(
+                os.path.join(os.path.dirname(__file__), "..", "..", "backend", "planning")
+            ),
             timeout=Duration.seconds(30),
             memory_size=256,
         )
 
-        # Permissions Bedrock pour le planning
+        # fitcoach-planning: bedrock:InvokeModel + dynamodb Read/Write
         planning_lambda.add_to_role_policy(
             iam.PolicyStatement(
                 actions=["bedrock:InvokeModel"],
-                resources=["arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-3-haiku-20240307-v1:0"],
+                resources=["*"],
             )
         )
-
-        # Permissions DynamoDB
         planning_table.grant_read_write_data(planning_lambda)
-        sessions_table.grant_read_write_data(pose_lambda)
 
-        # ===== Lambda - Conseils =====
+        # ===== Lambda - fitcoach-advice =====
+        # 256 MB | 30s timeout | Bedrock Claude
         advice_lambda = _lambda.Function(
             self, "AdviceLambda",
             function_name="fitcoach-advice",
             runtime=_lambda.Runtime.PYTHON_3_12,
             handler="handler.handler",
-            code=_lambda.Code.from_asset("../backend/advice"),
+            code=_lambda.Code.from_asset(
+                os.path.join(os.path.dirname(__file__), "..", "..", "backend", "advice")
+            ),
             timeout=Duration.seconds(30),
             memory_size=256,
         )
 
+        # fitcoach-advice: bedrock:InvokeModel
         advice_lambda.add_to_role_policy(
             iam.PolicyStatement(
                 actions=["bedrock:InvokeModel"],
-                resources=["arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-3-haiku-20240307-v1:0"],
+                resources=["*"],
             )
         )
 
-        # ===== API Gateway =====
+        # ===== Amazon API Gateway - REST API, CORS enabled =====
         api = apigw.RestApi(
             self, "FitCoachAPI",
             rest_api_name="FitCoach AI API",
             default_cors_preflight_options=apigw.CorsOptions(
                 allow_origins=apigw.Cors.ALL_ORIGINS,
                 allow_methods=apigw.Cors.ALL_METHODS,
+                allow_headers=["Content-Type", "Authorization"],
             ),
         )
 
-        # Routes
-        analyze = api.root.add_resource("analyze-pose")
-        analyze.add_method("POST", apigw.LambdaIntegration(pose_lambda))
+        # POST /analyze-pose → fitcoach-pose-analysis
+        analyze_resource = api.root.add_resource("analyze-pose")
+        analyze_resource.add_method(
+            "POST",
+            apigw.LambdaIntegration(pose_lambda),
+        )
 
-        planning = api.root.add_resource("generate-planning")
-        planning.add_method("POST", apigw.LambdaIntegration(planning_lambda))
+        # POST /generate-planning → fitcoach-planning
+        planning_resource = api.root.add_resource("generate-planning")
+        planning_resource.add_method(
+            "POST",
+            apigw.LambdaIntegration(planning_lambda),
+        )
 
-        advice = api.root.add_resource("get-advice")
-        advice.add_method("POST", apigw.LambdaIntegration(advice_lambda))
+        # POST /get-advice → fitcoach-advice
+        advice_resource = api.root.add_resource("get-advice")
+        advice_resource.add_method(
+            "POST",
+            apigw.LambdaIntegration(advice_lambda),
+        )
 
         # ===== Outputs =====
-        CfnOutput(self, "ApiUrl", value=api.url, description="URL de l'API")
-        CfnOutput(self, "UserPoolId", value=user_pool.user_pool_id)
-        CfnOutput(self, "UserPoolClientId", value=user_pool_client.user_pool_client_id)
+        CfnOutput(self, "ApiUrl",
+                  value=api.url,
+                  description="URL de l'API Gateway")
+        CfnOutput(self, "UserPoolId",
+                  value=user_pool.user_pool_id,
+                  description="Cognito User Pool ID")
+        CfnOutput(self, "UserPoolClientId",
+                  value=user_pool_client.user_pool_client_id,
+                  description="Cognito User Pool Client ID")
