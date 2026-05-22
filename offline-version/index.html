@@ -1,0 +1,349 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Musclor AI — Offline</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: sans-serif; text-align: center; background: #1a1a2e; color: #eee; padding: 15px; }
+        h1 { font-size: 2rem; margin-bottom: 8px; }
+        h1 span { color: #0ff; }
+        #count { font-size: 6rem; color: #0ff; line-height: 1; }
+        #timer { font-size: 6rem; color: #0ff; line-height: 1; }
+        #container { position: relative; display: inline-block; width: 520px; height: 390px; margin: 8px auto; background: #000; border-radius: 8px; overflow: hidden; }
+        video { width: 100%; height: 100%; object-fit: cover; transform: scaleX(-1); }
+        canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; transform: scaleX(-1); pointer-events: none; }
+        #status { color: #f55; margin: 5px 0; height: 18px; font-size: 0.9rem; }
+        #status.connected { color: #0f0; }
+        #feedback { font-size: 2.5rem; font-weight: 900; min-height: 60px; margin: 10px 0; padding: 10px; text-transform: uppercase; letter-spacing: 1px; }
+        #feedback.good { color: #0f0; }
+        #feedback.bad { color: #f44; }
+        button { padding: 10px 18px; font-size: 1rem; border: none; border-radius: 6px; cursor: pointer; background: #0ff; color: #000; margin: 4px; font-weight: bold; }
+        button:disabled { opacity: 0.4; }
+        .mode-btn { background: #333; color: #eee; border: 2px solid #555; }
+        .mode-btn.active { border-color: #0ff; background: #1a3a4a; color: #0ff; }
+        #modes { margin: 8px 0; }
+        #retry-btn { background: #f80; display: none; }
+        #plan-config { display: none; margin: 10px 0; padding: 15px; background: #222; border-radius: 8px; }
+        #plan-config select, #plan-config button { margin: 5px; }
+        #plan-config select { padding: 8px; border-radius: 4px; background: #333; color: #eee; border: 1px solid #555; font-size: 1rem; }
+        #plan-progress { display: none; margin: 10px 0; padding: 10px; background: #222; border-radius: 8px; font-size: 1.1rem; }
+        #plan-progress .current-ex { color: #0ff; font-size: 1.4rem; font-weight: bold; }
+        #plan-progress .remaining { color: #888; font-size: 0.9rem; }
+    </style>
+</head>
+<body>
+    <h1>💪 <span>Musclor AI</span> <small style="font-size:0.5em;color:#888">offline</small></h1>
+    <div id="modes">
+        <button class="mode-btn active" data-mode="pushups">🫸 Pompes</button>
+        <button class="mode-btn" data-mode="squats">🦵 Squats</button>
+        <button class="mode-btn" data-mode="plank">🧘 Gainage</button>
+        <button class="mode-btn" data-mode="plan">📋 Programme</button>
+    </div>
+    <div id="plan-config">
+        <div>
+            <select id="plan-level">
+                <option value="beginner">Débutant</option>
+                <option value="intermediate">Intermédiaire</option>
+                <option value="hard">Difficile</option>
+            </select>
+            <select id="plan-time">
+                <option value="5">5 min</option>
+                <option value="10">10 min</option>
+                <option value="15">15 min</option>
+                <option value="20">20 min</option>
+            </select>
+            <button id="generate-plan">Générer le programme</button>
+        </div>
+    </div>
+    <div id="plan-progress">
+        <div class="current-ex" id="plan-current"></div>
+        <div class="remaining" id="plan-remaining"></div>
+    </div>
+    <div>
+        <button id="startBtn">Démarrer</button>
+        <button id="stopBtn" disabled>Arrêter</button>
+        <button id="retry-btn">🔄 Reprendre</button>
+    </div>
+    <div id="status">Prêt</div>
+    <div id="count">0</div>
+    <div id="timer" style="display:none">0:00</div>
+    <div id="feedback"></div>
+    <div id="container">
+        <video id="video" autoplay playsinline muted></video>
+        <canvas id="overlay"></canvas>
+    </div>
+
+    <script type="module">
+        import { PoseLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/vision_bundle.mjs";
+
+        const video = document.getElementById('video');
+        const overlay = document.getElementById('overlay');
+        const ctx = overlay.getContext('2d');
+        const countEl = document.getElementById('count');
+        const timerEl = document.getElementById('timer');
+        const statusEl = document.getElementById('status');
+        const feedbackEl = document.getElementById('feedback');
+        const startBtn = document.getElementById('startBtn');
+        const stopBtn = document.getElementById('stopBtn');
+        const retryBtn = document.getElementById('retry-btn');
+        const planConfig = document.getElementById('plan-config');
+        const planProgress = document.getElementById('plan-progress');
+        const planCurrent = document.getElementById('plan-current');
+        const planRemaining = document.getElementById('plan-remaining');
+
+        let streaming = false, poseLandmarker = null, animFrame = null;
+        let count = 0, enBas = false;
+        let exercise = 'pushups';
+        let mode = 'pushups';
+        let plankStart = null, plankElapsed = 0, plankStopped = false;
+        let lastLandmarks = null;
+        let plan = [], planIndex = 0, planTarget = 0;
+
+        const ARTICULATIONS = {
+            CoudeDroit: [12, 14, 16], CoudeGauche: [11, 13, 15],
+            HancheDroite: [12, 24, 26], HancheGauche: [11, 23, 25],
+            GenouDroit: [24, 26, 28], GenouGauche: [23, 25, 27],
+            EpauleDroite: [11, 12, 14], EpauleGauche: [12, 11, 13],
+        };
+
+        function getAngle(landmarks, a, b, c) {
+            if (landmarks[a].visibility < 0.5 || landmarks[b].visibility < 0.5 || landmarks[c].visibility < 0.5) return null;
+            const ab = [landmarks[b].x - landmarks[a].x, landmarks[b].y - landmarks[a].y];
+            const bc = [landmarks[b].x - landmarks[c].x, landmarks[b].y - landmarks[c].y];
+            const nAB = Math.hypot(...ab), nBC = Math.hypot(...bc);
+            if (nAB === 0 || nBC === 0) return null;
+            const dot = (ab[0]*bc[0] + ab[1]*bc[1]) / (nAB * nBC);
+            return Math.acos(Math.max(-1, Math.min(1, dot))) * 180 / Math.PI;
+        }
+
+        function computeAngles(landmarks) {
+            const angles = {};
+            for (const [name, [a, b, c]] of Object.entries(ARTICULATIONS)) {
+                angles[name] = getAngle(landmarks, a, b, c);
+            }
+            return angles;
+        }
+
+        const PLANS = {
+            beginner: {
+                5: [{ex:'pushups',reps:8},{ex:'squats',reps:10},{ex:'plank',secs:20},{ex:'pushups',reps:6},{ex:'squats',reps:8}],
+                10: [{ex:'pushups',reps:10},{ex:'squats',reps:12},{ex:'plank',secs:30},{ex:'pushups',reps:8},{ex:'squats',reps:10},{ex:'plank',secs:25},{ex:'pushups',reps:8},{ex:'squats',reps:10}],
+                15: [{ex:'pushups',reps:10},{ex:'squats',reps:12},{ex:'plank',secs:30},{ex:'pushups',reps:10},{ex:'squats',reps:12},{ex:'plank',secs:30},{ex:'pushups',reps:8},{ex:'squats',reps:10},{ex:'plank',secs:25},{ex:'pushups',reps:8}],
+                20: [{ex:'pushups',reps:12},{ex:'squats',reps:15},{ex:'plank',secs:30},{ex:'pushups',reps:10},{ex:'squats',reps:12},{ex:'plank',secs:30},{ex:'pushups',reps:10},{ex:'squats',reps:12},{ex:'plank',secs:25},{ex:'pushups',reps:8},{ex:'squats',reps:10},{ex:'plank',secs:20}],
+            },
+            intermediate: {
+                5: [{ex:'pushups',reps:15},{ex:'squats',reps:15},{ex:'plank',secs:40},{ex:'pushups',reps:12},{ex:'squats',reps:12}],
+                10: [{ex:'pushups',reps:15},{ex:'squats',reps:18},{ex:'plank',secs:45},{ex:'pushups',reps:15},{ex:'squats',reps:15},{ex:'plank',secs:40},{ex:'pushups',reps:12},{ex:'squats',reps:12}],
+                15: [{ex:'pushups',reps:18},{ex:'squats',reps:20},{ex:'plank',secs:45},{ex:'pushups',reps:15},{ex:'squats',reps:18},{ex:'plank',secs:45},{ex:'pushups',reps:15},{ex:'squats',reps:15},{ex:'plank',secs:40},{ex:'pushups',reps:12}],
+                20: [{ex:'pushups',reps:20},{ex:'squats',reps:20},{ex:'plank',secs:50},{ex:'pushups',reps:18},{ex:'squats',reps:20},{ex:'plank',secs:45},{ex:'pushups',reps:15},{ex:'squats',reps:18},{ex:'plank',secs:45},{ex:'pushups',reps:15},{ex:'squats',reps:15},{ex:'plank',secs:40}],
+            },
+            hard: {
+                5: [{ex:'pushups',reps:20},{ex:'squats',reps:25},{ex:'plank',secs:60},{ex:'pushups',reps:18},{ex:'squats',reps:20}],
+                10: [{ex:'pushups',reps:25},{ex:'squats',reps:25},{ex:'plank',secs:60},{ex:'pushups',reps:20},{ex:'squats',reps:25},{ex:'plank',secs:50},{ex:'pushups',reps:18},{ex:'squats',reps:20}],
+                15: [{ex:'pushups',reps:25},{ex:'squats',reps:30},{ex:'plank',secs:60},{ex:'pushups',reps:25},{ex:'squats',reps:25},{ex:'plank',secs:60},{ex:'pushups',reps:20},{ex:'squats',reps:25},{ex:'plank',secs:50},{ex:'pushups',reps:18}],
+                20: [{ex:'pushups',reps:30},{ex:'squats',reps:30},{ex:'plank',secs:60},{ex:'pushups',reps:25},{ex:'squats',reps:30},{ex:'plank',secs:60},{ex:'pushups',reps:25},{ex:'squats',reps:25},{ex:'plank',secs:55},{ex:'pushups',reps:20},{ex:'squats',reps:25},{ex:'plank',secs:50}],
+            }
+        };
+
+        const EX_NAMES = { pushups: 'Pompes', squats: 'Squats', plank: 'Gainage' };
+
+        document.getElementById('generate-plan').onclick = () => {
+            const level = document.getElementById('plan-level').value;
+            const time = document.getElementById('plan-time').value;
+            plan = PLANS[level][time];
+            planIndex = 0;
+            startPlanExercise();
+        };
+
+        function startPlanExercise() {
+            if (planIndex >= plan.length) {
+                planCurrent.textContent = '🎉 PROGRAMME TERMINÉ !';
+                planRemaining.textContent = '';
+                setFeedback('BRAVO !', 'good');
+                return;
+            }
+            const step = plan[planIndex];
+            exercise = step.ex;
+            count = 0; enBas = false;
+            plankStart = null; plankElapsed = 0; plankStopped = false;
+            planTarget = step.reps || step.secs;
+            countEl.style.display = exercise === 'plank' ? 'none' : 'block';
+            timerEl.style.display = exercise === 'plank' ? 'block' : 'none';
+            countEl.textContent = '0';
+            timerEl.textContent = '0:00';
+            retryBtn.style.display = 'none';
+            const remaining = plan.slice(planIndex + 1).map(s => `${EX_NAMES[s.ex]} ${s.reps||s.secs+'s'}`).join(' → ');
+            planCurrent.textContent = `${EX_NAMES[exercise]} — ${step.reps ? step.reps + ' reps' : step.secs + 's'}`;
+            planRemaining.textContent = remaining ? `Ensuite : ${remaining}` : '';
+            planProgress.style.display = 'block';
+            if (exercise === 'plank') setFeedback(`GAINAGE ${step.secs}s — EN POSITION !`, 'good');
+            else setFeedback(`${EX_NAMES[exercise].toUpperCase()} — ${step.reps} REPS !`, 'good');
+        }
+
+        function checkPlanComplete() {
+            if (mode !== 'plan') return;
+            if (exercise === 'plank') {
+                const total = plankElapsed + (plankStart ? (Date.now() - plankStart) / 1000 : 0);
+                if (total >= planTarget) { planIndex++; startPlanExercise(); }
+            } else {
+                if (count >= planTarget) { planIndex++; startPlanExercise(); }
+            }
+        }
+
+        document.querySelectorAll('.mode-btn').forEach(btn => {
+            btn.onclick = () => {
+                document.querySelectorAll('.mode-btn').forEach(b => b.classList.remove('active'));
+                btn.classList.add('active');
+                mode = btn.dataset.mode;
+                exercise = mode === 'plan' ? 'pushups' : mode;
+                planConfig.style.display = mode === 'plan' ? 'block' : 'none';
+                planProgress.style.display = 'none';
+                resetState();
+            };
+        });
+
+        retryBtn.onclick = () => {
+            plankStopped = false; plankStart = null;
+            timerEl.textContent = formatTime(plankElapsed);
+            retryBtn.style.display = 'none';
+            feedbackEl.textContent = ''; feedbackEl.className = '';
+        };
+
+        function resetState() {
+            count = 0; enBas = false;
+            plankStart = null; plankElapsed = 0; plankStopped = false;
+            countEl.textContent = '0'; timerEl.textContent = '0:00';
+            feedbackEl.textContent = ''; feedbackEl.className = '';
+            retryBtn.style.display = 'none';
+            countEl.style.display = exercise === 'plank' ? 'none' : 'block';
+            timerEl.style.display = exercise === 'plank' ? 'block' : 'none';
+        }
+
+        const CONNECTIONS = [[11,12],[11,13],[13,15],[12,14],[14,16],[11,23],[12,24],[23,24],[23,25],[24,26],[25,27],[26,28],[27,29],[28,30],[29,31],[30,32]];
+
+        async function initPose() {
+            const vision = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm");
+            poseLandmarker = await PoseLandmarker.createFromOptions(vision, {
+                baseOptions: { modelAssetPath: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task" },
+                runningMode: "VIDEO", numPoses: 1
+            });
+        }
+
+        function drawSkeleton(landmarks) {
+            overlay.width = video.videoWidth; overlay.height = video.videoHeight;
+            ctx.clearRect(0, 0, overlay.width, overlay.height);
+            ctx.strokeStyle = '#00ff88'; ctx.lineWidth = 3;
+            for (const [i, j] of CONNECTIONS) {
+                const a = landmarks[i], b = landmarks[j];
+                if (a.visibility > 0.5 && b.visibility > 0.5) {
+                    ctx.beginPath();
+                    ctx.moveTo(a.x * overlay.width, a.y * overlay.height);
+                    ctx.lineTo(b.x * overlay.width, b.y * overlay.height);
+                    ctx.stroke();
+                }
+            }
+            ctx.fillStyle = '#ff0044';
+            for (const lm of landmarks) {
+                if (lm.visibility > 0.5) {
+                    ctx.beginPath();
+                    ctx.arc(lm.x * overlay.width, lm.y * overlay.height, 4, 0, 2 * Math.PI);
+                    ctx.fill();
+                }
+            }
+        }
+
+        function handlePushups(angles) {
+            const hip = angles.HancheDroite ?? angles.HancheGauche;
+            if (hip == null) return setFeedback("MONTREZ VOTRE CORPS ENTIER", 'bad');
+            if (hip < 160) return setFeedback("CORPS PLUS DROIT !", 'bad');
+            const elbow = angles.CoudeDroit ?? angles.CoudeGauche;
+            if (elbow == null) return setFeedback("MONTREZ VOS BRAS", 'bad');
+            setFeedback('BONNE POSTURE ✓', 'good');
+            if (elbow <= 110) enBas = true;
+            else if (enBas && elbow >= 140) { enBas = false; count++; countEl.textContent = count; checkPlanComplete(); }
+        }
+
+        function handleSquats(angles) {
+            const hip = angles.HancheDroite ?? angles.HancheGauche;
+            const knee = angles.GenouDroit ?? angles.GenouGauche;
+            if (knee == null || hip == null) return setFeedback("METTEZ-VOUS DE PROFIL", 'bad');
+            if (hip < 70) return setFeedback("DOS PLUS DROIT !", 'bad');
+            if (enBas) setFeedback('REMONTEZ !', 'good');
+            else if (knee > 140) setFeedback('DESCENDEZ PLUS BAS !', 'good');
+            else setFeedback('ENCORE PLUS BAS...', 'good');
+            if (knee <= 100) enBas = true;
+            else if (enBas && knee >= 150) { enBas = false; count++; countEl.textContent = count; checkPlanComplete(); }
+        }
+
+        function handlePlank(angles) {
+            if (plankStopped) return;
+            const hip = angles.HancheDroite ?? angles.HancheGauche;
+            const elbow = angles.CoudeDroit ?? angles.CoudeGauche;
+            if (hip == null) return setFeedback("MONTREZ VOTRE CORPS ENTIER", 'bad');
+
+            let postureOk = true, msg = '';
+            if (lastLandmarks) {
+                const shoulderY = Math.min(lastLandmarks[11]?.y ?? 1, lastLandmarks[12]?.y ?? 1);
+                const hipY = Math.min(lastLandmarks[23]?.y ?? 0, lastLandmarks[24]?.y ?? 0);
+                if (hipY - shoulderY < 0.02) { msg = "SOULEVEZ-VOUS DU SOL !"; postureOk = false; }
+            }
+            if (postureOk && elbow != null && elbow > 150) { msg = "PLIEZ LES COUDES !"; postureOk = false; }
+            if (postureOk && hip < 145) { msg = "FESSES PLUS HAUTES !"; postureOk = false; }
+            if (postureOk && hip > 190) { msg = "FESSES PLUS BASSES !"; postureOk = false; }
+
+            if (!postureOk) {
+                setFeedback(msg, 'bad');
+                if (plankStart) {
+                    plankElapsed += (Date.now() - plankStart) / 1000;
+                    plankStart = null; plankStopped = true;
+                    retryBtn.style.display = 'inline-block';
+                    setFeedback(`POSTURE PERDUE ! ${formatTime(plankElapsed)}`, 'bad');
+                }
+                return;
+            }
+            setFeedback('TENEZ BON ! ✓', 'good');
+            if (!plankStart) plankStart = Date.now();
+            timerEl.textContent = formatTime(plankElapsed + (Date.now() - plankStart) / 1000);
+            checkPlanComplete();
+        }
+
+        function formatTime(s) { return `${Math.floor(s/60)}:${Math.floor(s%60).toString().padStart(2,'0')}`; }
+        function setFeedback(msg, type) { feedbackEl.textContent = msg; feedbackEl.className = type; }
+
+        function processFrame() {
+            if (!streaming) return;
+            const result = poseLandmarker.detectForVideo(video, performance.now());
+            if (result.landmarks && result.landmarks.length > 0) {
+                const lm = result.landmarks[0].map(p => ({ x: p.x, y: p.y, z: p.z, visibility: p.visibility }));
+                lastLandmarks = lm;
+                drawSkeleton(lm);
+                const angles = computeAngles(lm);
+                if (exercise === 'pushups') handlePushups(angles);
+                else if (exercise === 'squats') handleSquats(angles);
+                else if (exercise === 'plank') handlePlank(angles);
+            }
+            animFrame = requestAnimationFrame(processFrame);
+        }
+
+        startBtn.onclick = async () => {
+            statusEl.textContent = 'Chargement du modèle...';
+            if (!poseLandmarker) await initPose();
+            const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 480, height: 360 } });
+            video.srcObject = stream; await video.play();
+            statusEl.textContent = 'Actif (hors-ligne)'; statusEl.className = 'connected';
+            streaming = true; startBtn.disabled = true; stopBtn.disabled = false;
+            resetState(); processFrame();
+        };
+
+        stopBtn.onclick = () => {
+            streaming = false;
+            if (animFrame) cancelAnimationFrame(animFrame);
+            if (video.srcObject) video.srcObject.getTracks().forEach(t => t.stop());
+            startBtn.disabled = false; stopBtn.disabled = true;
+            statusEl.textContent = 'Arrêté'; statusEl.className = '';
+        };
+    </script>
+</body>
+</html>
